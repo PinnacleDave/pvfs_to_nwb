@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pvfs-to-nwb"
+version = "0.1.0"
+description = "Convert Pinnacle PVFS (Virtual File System) recordings to Neurodata Without Borders (NWB)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "PVFS to NWB Contributors" },
+]
+keywords = [
+    "neuroscience",
+    "electrophysiology",
+    "EEG",
+    "NWB",
+    "PVFS",
+    "Pinnacle",
+    "NeuroConv",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.22",
+    "pynwb>=2.5",
+    "hdmf>=3.12",
+    "neuroconv>=0.6",
+    "spikeinterface>=0.101",
+    "pypvfs>=0.1",
+]
+
+[project.optional-dependencies]
+video = [
+    "pypvfs[video]",
+    "av>=10.0",
+]
+test = [
+    "pytest>=7",
+    "pytest-cov",
+]
+dev = [
+    "pvfs-to-nwb[test,video]",
+]
+
+[project.scripts]
+pvfs-to-nwb = "pvfs_to_nwb._cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Pinnacle-Technology-Inc/pypvfs"
+Documentation = "https://neuroconv.readthedocs.io/en/stable/"
+Issues = "https://github.com/Pinnacle-Technology-Inc/pypvfs/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pvfs_to_nwb*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

@@ -37,6 +37,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip PVFS annotations (no NWB epochs).",
     )
     parser.add_argument(
+        "--no-sleep-scoring",
+        action="store_true",
+        help=(
+            "Skip PVFS sleep-stage scoring (no 'sleep_stages_session_<n>' "
+            "TimeIntervals tables under nwbfile.intervals)."
+        ),
+    )
+    parser.add_argument(
         "--embed-frames",
         action="store_true",
         help=(
@@ -120,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     converter = PvfsNWBConverter(
         file_path=pvfs_path,
         include_annotations=not args.no_annotations,
+        include_sleep_scoring=not args.no_sleep_scoring,
         include_video=not args.no_video,
         video_output_dir=args.video_output_dir,
         embed_frames=args.embed_frames,

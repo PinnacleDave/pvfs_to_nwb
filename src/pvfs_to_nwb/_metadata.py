@@ -12,6 +12,7 @@ high-level :class:`pvfs_tools.Core.pvfs_data_file.PvfsDataFile` wrapper.
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -175,9 +176,17 @@ class PvfsMetadata:
                 f"({self.experiment.name})."
             )
         else:
+            # NWB's metadata schema requires ``Subject.subject_id``.  PVFS does not
+            # always record one (e.g. Pinnacle's public sleep_data sample leaves
+            # ``ExperimentInformation.name`` empty), so we fall back to a stable
+            # placeholder; users should override it via metadata or the CLI
+            # ``--subject-id`` flag when the real id is known.
+            subject["subject_id"] = "unknown"
             subject["description"] = (
-                "Subject metadata from PVFS; age and other details are not stored "
-                "in the source file."
+                "Subject metadata from PVFS; subject_id was not recorded in the "
+                "source file and has been set to 'unknown'. Override via "
+                'metadata["Subject"]["subject_id"] or the CLI --subject-id flag '
+                "when the real id is known."
             )
 
         metadata: dict = {}
@@ -306,6 +315,262 @@ def read_pvfs_metadata(file_path: str | os.PathLike) -> PvfsMetadata:
         db_path = extract_experiment_db(vfs)
         try:
             return _read_metadata_from_db(db_path)
+        finally:
+            try:
+                db_path.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - non-fatal cleanup
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Sleep scoring readers
+# ---------------------------------------------------------------------------
+#
+# Pinnacle's PVFS stores manual / automatic sleep-stage scoring in four tables
+# inside ``experiment.db3``:
+#
+# * ``scores_values_table`` -- per-session legend mapping integer scores to
+#   names (e.g. ``1 -> "Wake"``, ``2 -> "Non REM"``), plus ``flags`` and
+#   display ``color`` (RGBA hex).
+# * ``sleep_scoring_session_table`` -- per-session metadata (scorer / user_id,
+#   epoch length in seconds, source data file, animal id, experiment id).
+# * ``sleep_scores_table`` -- the actual per-epoch scores (start/end time as
+#   ``(seconds, sub_seconds)`` pairs, integer ``score`` referencing the legend,
+#   plus a stable per-epoch GUID ``uid``).
+# * ``sleep_scoring_parameters_table`` -- houses Pinnacle's internal next-id
+#   counter. We deliberately ignore it.
+#
+# pypvfs's :class:`ExperimentDatabase` does not expose these tables, so we open
+# the SQLite file directly with the stdlib driver. The tables are tolerated as
+# *optional*: their absence means "no scoring data" and yields an empty result.
+
+SCORE_LEGEND_TABLE = "scores_values_table"
+SLEEP_SCORES_TABLE = "sleep_scores_table"
+SLEEP_SCORING_SESSION_TABLE = "sleep_scoring_session_table"
+
+
+@dataclass(frozen=True)
+class ScoreLegendEntry:
+    """One row of :data:`SCORE_LEGEND_TABLE` (per-session legend)."""
+
+    score: int
+    score_name: str
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class SleepEpoch:
+    """One scored epoch from :data:`SLEEP_SCORES_TABLE`."""
+
+    start_abs_seconds: float
+    """Absolute POSIX seconds (``start_time_seconds + start_time_sub_seconds``)."""
+
+    stop_abs_seconds: float
+    """Absolute POSIX seconds (``end_time_seconds + end_time_sub_seconds``)."""
+
+    score: int
+    """Raw integer score; cross-reference :class:`ScoreLegendEntry`."""
+
+    uid: str
+    """Per-epoch GUID from PVFS (lets external tools round-trip score edits)."""
+
+
+@dataclass(frozen=True)
+class SleepScoringSession:
+    """A single Pinnacle scoring session worth of legend + scores + metadata."""
+
+    session_number: int
+    user_id: str | None
+    epoch_length_seconds: float | None
+    animal_id: str | None
+    experiment_id: str | None
+    data_file_name: str | None
+    legend: dict[int, ScoreLegendEntry]
+    epochs: list[SleepEpoch]
+
+    def label_for(self, score: int) -> str:
+        """Resolve a raw score integer to a human-readable name.
+
+        Falls back to ``"score_<n>"`` when the legend has no matching entry
+        (e.g. a custom value Pinnacle does not document).
+        """
+        entry = self.legend.get(int(score))
+        return entry.score_name if entry is not None else f"score_{int(score)}"
+
+    def flags_for(self, score: int) -> int:
+        """Return the legend ``flags`` for *score*, or ``0`` when unknown."""
+        entry = self.legend.get(int(score))
+        return int(entry.flags) if entry is not None else 0
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _parse_sub_seconds(value: object) -> float:
+    """Match pypvfs's behaviour: ``float(varchar)`` with safe fall-back to 0."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_epoch_length(value: object) -> float | None:
+    """``sleep_scoring_session_table.epoch_length`` is stored as VARCHAR."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _strip(text: object) -> str | None:
+    """Strip Pinnacle's right-padded VARCHARs (they often have trailing spaces)."""
+    if text is None:
+        return None
+    stripped = str(text).strip()
+    return stripped or None
+
+
+def read_sleep_scoring_sessions(
+    db_path: str | os.PathLike,
+) -> dict[int, SleepScoringSession]:
+    """Read every populated sleep-scoring session from an extracted ``experiment.db3``.
+
+    A session is considered "populated" if :data:`SLEEP_SCORES_TABLE` has at
+    least one row with that ``session_number``.  Sessions that only appear in
+    the legend (``scores_values_table``) but have no actual scores are skipped
+    -- Pinnacle accumulates historical legend rows there as scoring sessions
+    are created and deleted.
+
+    Returns a ``dict`` keyed by ``session_number``.  Returns an empty dict when
+    the database does not contain any sleep-scoring tables (typical for raw
+    recordings that have never been opened in Pinnacle's scoring UI).
+    """
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        if not _table_exists(con, SLEEP_SCORES_TABLE):
+            return {}
+
+        populated_sessions = [
+            int(row[0])
+            for row in con.execute(
+                f"SELECT DISTINCT session_number FROM {SLEEP_SCORES_TABLE} "
+                "ORDER BY session_number"
+            )
+        ]
+        if not populated_sessions:
+            return {}
+
+        sessions: dict[int, SleepScoringSession] = {}
+        for session_number in populated_sessions:
+            legend = _read_legend(con, session_number)
+            metadata_row = _read_session_metadata(con, session_number)
+            epochs = _read_session_epochs(con, session_number)
+
+            sessions[session_number] = SleepScoringSession(
+                session_number=session_number,
+                user_id=metadata_row.get("user_id"),
+                epoch_length_seconds=metadata_row.get("epoch_length_seconds"),
+                animal_id=metadata_row.get("animal_id"),
+                experiment_id=metadata_row.get("experiment_id"),
+                data_file_name=metadata_row.get("data_file_name"),
+                legend=legend,
+                epochs=epochs,
+            )
+        return sessions
+    finally:
+        con.close()
+
+
+def _read_legend(
+    con: sqlite3.Connection, session_number: int
+) -> dict[int, ScoreLegendEntry]:
+    if not _table_exists(con, SCORE_LEGEND_TABLE):
+        return {}
+    legend: dict[int, ScoreLegendEntry] = {}
+    for row in con.execute(
+        f"SELECT score, score_name, flags FROM {SCORE_LEGEND_TABLE} "
+        "WHERE session_number=? ORDER BY score",
+        (session_number,),
+    ):
+        score = int(row["score"])
+        name = _strip(row["score_name"]) or f"score_{score}"
+        flags = int(row["flags"]) if row["flags"] is not None else 0
+        legend[score] = ScoreLegendEntry(score=score, score_name=name, flags=flags)
+    return legend
+
+
+def _read_session_metadata(
+    con: sqlite3.Connection, session_number: int
+) -> dict[str, object]:
+    """Read one row of :data:`SLEEP_SCORING_SESSION_TABLE`, returning a plain dict."""
+    if not _table_exists(con, SLEEP_SCORING_SESSION_TABLE):
+        return {}
+    row = con.execute(
+        f"SELECT user_id, epoch_length, data_file_name, experiment_id, animal_id "
+        f"FROM {SLEEP_SCORING_SESSION_TABLE} WHERE session_number=? LIMIT 1",
+        (session_number,),
+    ).fetchone()
+    if row is None:
+        return {}
+    return {
+        "user_id": _strip(row["user_id"]),
+        "epoch_length_seconds": _parse_epoch_length(row["epoch_length"]),
+        "data_file_name": _strip(row["data_file_name"]),
+        "experiment_id": _strip(row["experiment_id"]),
+        "animal_id": _strip(row["animal_id"]),
+    }
+
+
+def _read_session_epochs(
+    con: sqlite3.Connection, session_number: int
+) -> list[SleepEpoch]:
+    epochs: list[SleepEpoch] = []
+    for row in con.execute(
+        f"SELECT start_time_seconds, start_time_sub_seconds, "
+        f"end_time_seconds, end_time_sub_seconds, score, uid "
+        f"FROM {SLEEP_SCORES_TABLE} WHERE session_number=? "
+        "ORDER BY start_time_seconds, start_time_sub_seconds",
+        (session_number,),
+    ):
+        start_sec = row["start_time_seconds"]
+        end_sec = row["end_time_seconds"]
+        if start_sec is None or end_sec is None:
+            continue  # malformed row; skip rather than fail the whole import
+        start_abs = float(start_sec) + _parse_sub_seconds(row["start_time_sub_seconds"])
+        stop_abs = float(end_sec) + _parse_sub_seconds(row["end_time_sub_seconds"])
+        epochs.append(
+            SleepEpoch(
+                start_abs_seconds=start_abs,
+                stop_abs_seconds=stop_abs,
+                score=int(row["score"]),
+                uid=str(row["uid"]) if row["uid"] is not None else "",
+            )
+        )
+    return epochs
+
+
+def read_sleep_scoring_sessions_from_pvfs(
+    file_path: str | os.PathLike,
+) -> dict[int, SleepScoringSession]:
+    """Convenience wrapper: open the PVFS, extract the DB, read scoring sessions.
+
+    The extracted database file is removed before returning.  Returns an empty
+    dict when the PVFS contains no sleep-scoring tables.
+    """
+    with open_pvfs(file_path) as vfs:
+        db_path = extract_experiment_db(vfs)
+        try:
+            return read_sleep_scoring_sessions(db_path)
         finally:
             try:
                 db_path.unlink(missing_ok=True)

@@ -125,7 +125,12 @@ class PvfsRecordingInterface(BaseRecordingExtractorInterface):
         if self.es_key is not None:
             rate = self.recording_extractor.selected_sampling_rate
             rate_label = f"{rate:.0f}Hz" if rate == int(rate) else f"{rate:.3f}Hz"
-            es_name = f"{self.es_key}PVFS{rate_label}"
+            # Avoid double-decorating when PvfsNWBConverter (which controls multi-rate
+            # naming) already encoded "PVFS<rate>" into the es_key for us.
+            if "PVFS" in self.es_key:
+                es_name = self.es_key
+            else:
+                es_name = f"{self.es_key}PVFS{rate_label}"
             ecephys[self.es_key] = dict(
                 name=es_name,
                 description=(

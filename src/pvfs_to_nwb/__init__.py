@@ -7,6 +7,8 @@ The public surface mirrors what a NeuroConv-style integration would expose:
 
 * :class:`PvfsRecordingInterface` -- wraps the indexed time-series channels.
 * :class:`PvfsAnnotationsInterface` -- writes per-channel annotations as epochs.
+* :class:`PvfsSleepScoringInterface` -- writes Pinnacle sleep-stage scoring as
+  one ``TimeIntervals`` per scoring session under ``nwbfile.intervals``.
 * :class:`PvfsVideoInterface` -- exports embedded video tracks as ImageSeries.
 * :class:`PvfsNWBConverter` -- orchestrates all of the above.
 * :class:`PvfsRecordingExtractor` -- low level SpikeInterface ``BaseRecording``
@@ -17,6 +19,7 @@ from .extractors.pvfs_recording_extractor import PvfsRecordingExtractor
 from .pvfsannotationsinterface import PvfsAnnotationsInterface
 from .pvfsnwbconverter import PvfsNWBConverter
 from .pvfsrecordinginterface import PvfsRecordingInterface
+from .pvfssleepscoringinterface import PvfsSleepScoringInterface
 from .pvfsvideointerface import PvfsVideoInterface
 
 __all__ = [
@@ -24,6 +27,7 @@ __all__ = [
     "PvfsNWBConverter",
     "PvfsRecordingExtractor",
     "PvfsRecordingInterface",
+    "PvfsSleepScoringInterface",
     "PvfsVideoInterface",
 ]
 

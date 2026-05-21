@@ -8,6 +8,9 @@ matching set of NeuroConv data interfaces:
   at 2000 Hz become two interfaces);
 * one :class:`PvfsAnnotationsInterface` when the experiment database contains
   annotations and ``include_annotations`` is ``True``;
+* one :class:`PvfsSleepScoringInterface` when the experiment database contains
+  sleep-stage scoring and ``include_sleep_scoring`` is ``True`` (one NWB
+  ``TimeIntervals`` table per populated scoring session);
 * one :class:`PvfsVideoInterface` when the PVFS contains embedded video and
   ``include_video`` is ``True``.
 
@@ -31,10 +34,12 @@ from ._metadata import (
     filter_indexed_channels,
     open_pvfs,
     read_pvfs_metadata,
+    read_sleep_scoring_sessions_from_pvfs,
 )
 from .extractors.pvfs_recording_extractor import _channel_sampling_rate
 from .pvfsannotationsinterface import PvfsAnnotationsInterface
 from .pvfsrecordinginterface import PvfsRecordingInterface
+from .pvfssleepscoringinterface import PvfsSleepScoringInterface
 from .pvfsvideointerface import PvfsVideoInterface
 
 
@@ -57,6 +62,7 @@ class PvfsNWBConverter(ConverterPipe):
         self,
         file_path: FilePath,
         include_annotations: bool = True,
+        include_sleep_scoring: bool = True,
         include_video: bool = True,
         video_output_dir: str | Path | None = None,
         embed_frames: bool = False,
@@ -68,6 +74,7 @@ class PvfsNWBConverter(ConverterPipe):
 
         self.file_path = str(file_path)
         self.include_annotations = bool(include_annotations)
+        self.include_sleep_scoring = bool(include_sleep_scoring)
         self.include_video = bool(include_video)
         self.video_output_dir = Path(video_output_dir) if video_output_dir else None
         self.embed_frames = bool(embed_frames)
@@ -105,6 +112,15 @@ class PvfsNWBConverter(ConverterPipe):
             interfaces["Annotations"] = PvfsAnnotationsInterface(
                 file_path=str(file_path), verbose=verbose
             )
+
+        if self.include_sleep_scoring:
+            # Cheap pre-check (one SQLite query) so we only spin up the
+            # interface when actual scored epochs exist.
+            scoring_sessions = read_sleep_scoring_sessions_from_pvfs(file_path)
+            if any(session.epochs for session in scoring_sessions.values()):
+                interfaces["SleepScoring"] = PvfsSleepScoringInterface(
+                    file_path=str(file_path), verbose=verbose
+                )
 
         if self.include_video:
             video_interface = PvfsVideoInterface(
